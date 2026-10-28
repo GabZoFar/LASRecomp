@@ -3125,6 +3125,7 @@ static bool watch_small_mate(const RangeState *e, uint64_t plo) {
 // area load (#463; Metal ebe19c7). The big light lists are rewritten every frame: copied for their own writes a frame
 // or two before the small ones follow.
 // 1: a CPU write since `since`, 0: none seen.
+static const char *watch_why;  // (the evidence watch_check's last 1 rests on: the copy decision's log)
 static int watch_cpu_in_allocation(const RangeState *e, uint32_t since) {
     uint64_t lo = e->addr, hi = e->addr + e->size;
     for (bool grew = true; grew;) {
@@ -3146,7 +3147,6 @@ static int watch_cpu_in_allocation(const RangeState *e, uint32_t since) {
     return 0;
 }
 static int pages_seen_written(uint64_t addr, uint64_t size, uint32_t since);  // (the page tables below: no OS query)
-static const char *watch_why;  // (the evidence watch_check's last 1 rests on: the copy decision's log)
 static int watch_check(RangeState *e) {
     uint32_t since = e->wgen, now = e->wgen;
     int w = pages_cpu_written(e->addr, e->size, since, &now);  // (stamps every page of the range: the parts below read the stamps)

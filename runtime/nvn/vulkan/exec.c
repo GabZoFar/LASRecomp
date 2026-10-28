@@ -6410,10 +6410,13 @@ static void copy_texture(const TexRefRec *src, const TexRefRec *dst, uint64_t fl
     if (depth && s->format != d->format) return;
     static int via_color = -1;  // LARECOMP_VK_DEPTH_BLIT_VIA_COLOR=1: always (tests on GPUs that can blit depth)
     if (via_color < 0) via_color = getenv("LARECOMP_VK_DEPTH_BLIT_VIA_COLOR") ? atoi(getenv("LARECOMP_VK_DEPTH_BLIT_VIA_COLOR")) : 0;
-    // an upsampling depth copy interpolates (as metal.m / renderer.m do: issue #356); LARECOMP_DEPTH_UP_NEAREST=1: as before
+    // a depth copy that upsamples, or rescales by an uneven ratio between images of different scales (the AO depth at the
+    // Deck's 0.667x: 640x400 -> 480x270, issue #413), interpolates (as metal.m / renderer.m do: issue #356); nearest
+    // skipped rows unevenly there. LARECOMP_DEPTH_UP_NEAREST=1: as before
     static int up_nearest = -1;
     if (up_nearest < 0) up_nearest = getenv("LARECOMP_DEPTH_UP_NEAREST") != NULL;
-    if (depth && !up_nearest && (sa & da & VK_IMAGE_ASPECT_DEPTH_BIT) && (dw > sw || dh > sh) &&
+    bool uneven = dw > sw || dh > sh || ((ssx != dsx || ssy != dsy) && (sw % dw || sh % dh));
+    if (depth && !up_nearest && (sa & da & VK_IMAGE_ASPECT_DEPTH_BIT) && uneven &&
         depth_upsample_draw(cb, s, d, slv, sly, sx0, sy0, sw, sh, dlv, dly, dx0, dy0, dw, dh))
         return;
     if (depth && (sa & da & VK_IMAGE_ASPECT_DEPTH_BIT) && (via_color || !depth_blit_ok(d->format) || !depth_blit_ok(s->format))) {

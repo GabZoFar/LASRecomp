@@ -2839,7 +2839,7 @@ static VkSpan rscale_dedupe(int sg, const float rs[66][4], int nt) {
 #define SNAP_HALF (8ull << 20)
 #define SNAP_RING (2 * SNAP_HALF)
 enum { RS_PROBE, RS_COPY, RS_PLACE };
-typedef struct { uint64_t addr, size, copy, pristine, hash, frame, seg_hash[3]; uint32_t gen, level, wgen, looks; uint8_t mode, gpu_parts, wclass; bool cs_bound, draw_bound; } RangeState;  // (wgen, seg_hash, looks, gpu_parts, wclass: watch_check; pristine: rs_copy_make)
+typedef struct { uint64_t addr, size, copy, pristine, hash, frame, seg_hash[3]; uint32_t gen, level, wgen, looks; uint8_t mode, gpu_parts, wclass, rewrites; bool cs_bound, draw_bound; } RangeState;  // (wgen, seg_hash, looks, gpu_parts, wclass: watch_check; pristine: rs_copy_make; rewrites: watch_cpu_in_allocation)
 static RangeState rs_tab[512];
 static uint64_t rs_store_frame[512];  // (watch: the frame of the previous CPU write seen on a range's own pages)
 static int nrs;
@@ -3109,6 +3109,12 @@ static bool watch_small_mate(const RangeState *e, uint64_t plo) {
 // lands on a page wholly inside the range or inside its allocation - the watched ranges of 256 bytes or more around it,
 // less than 256 bytes apart, compute-bound: the light / exposure lists, one allocation the CPU memcpys (its two big
 // lists' pages) while the exposure program stores into the small ones, which share their pages with each other.
+// Another range's pages count only once that range was copied for writes on pages wholly its own (rewrites): BowWow's
+// skinning outputs (22048 / 3104 bytes, 66144 for the small BowWows) lie back to back, under 256 bytes apart, and his
+// spawn makes one initialisation store into each - counted for every neighbour, two spawns' worth within 8 frames
+// copied one, the dispatch wrote the copy while the CPU read the frozen original, and his body came apart after an
+// area load (#463; Metal ebe19c7). The big light lists are rewritten every frame: copied for their own writes a frame
+// or two before the small ones follow.
 // 1: a CPU write since `since`, 0: none seen.
 static int watch_cpu_in_allocation(const RangeState *e, uint32_t since) {
     uint64_t lo = e->addr, hi = e->addr + e->size;
@@ -3123,7 +3129,7 @@ static int watch_cpu_in_allocation(const RangeState *e, uint32_t since) {
     }
     for (int k = -1; k < nrs; k++) {  // (e itself, then the allocation's other ranges: a page wholly inside one of them)
         const RangeState *o = k < 0 ? e : &rs_tab[k];
-        if (k >= 0 && (o == e || o->size < 256 || !o->cs_bound || o->addr < lo || o->addr + o->size > hi)) continue;
+        if (k >= 0 && (o == e || !o->rewrites || o->size < 256 || !o->cs_bound || o->addr < lo || o->addr + o->size > hi)) continue;
         uint64_t p1 = (o->addr + WATCH_PAGE - 1) & ~(WATCH_PAGE - 1), pe = (o->addr + o->size) & ~(WATCH_PAGE - 1);
         uint32_t g;
         if (p1 < pe && pages_cpu_written(p1, pe - p1, since, &g) == 1) return 1;
@@ -3273,12 +3279,17 @@ static uint64_t snap_storage(uint64_t addr, uint64_t size, bool cs_slot) {
         return c ? c : addr;
     }
     if (e->mode == RS_PLACE && e->cs_bound && watch_on()) {  // (tracked: the OS's dirty bits decide, no hash)
+        uint32_t since = e->wgen;
         if (watch_check(e) != 1) return addr;
         // A write once (an initialisation: BowWow's skinning buffers at his spawn) stays in place; writes that keep
         // coming (within 8 frames of the previous one) are the CPU rewriting it: copied from now on (renderer.m 1ea4b16)
         int k = (int)(e - rs_tab);
         if (!rs_store_frame[k] || f - rs_store_frame[k] > 8) { rs_store_frame[k] = f; return addr; }
         e->mode = RS_COPY;
+        {   // (written on a page wholly its own: the CPU rewrites the range itself - its allocation's other ranges count its pages now)
+            uint64_t p1 = (addr + WATCH_PAGE - 1) & ~(WATCH_PAGE - 1), pe = (addr + size) & ~(WATCH_PAGE - 1);
+            e->rewrites = p1 < pe && pages_seen_written(p1, pe - p1, since) == 1;
+        }
         rs_log(e, "-> copy (CPU writes keep coming on its own pages)", cs_slot, f);
         c = rs_copy_make(e, range_hash(addr, size));
         return c ? c : addr;

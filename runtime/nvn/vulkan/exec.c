@@ -2838,8 +2838,17 @@ static VkSpan rscale_dedupe(int sg, const float rs[66][4], int nt) {
 // LARECOMP_OVERLAP_SNAP=0: off (everything in place, as before: shows the race).
 #define SNAP_HALF (8ull << 20)
 #define SNAP_RING (2 * SNAP_HALF)
+// The write watch doesn't count CPU writes into a range of 256 bytes or more for its first RS_SETUP_FRAMES frames in place
+// (from its first bind, and again when its learning starts over: a new level, or bound again after more than 8 frames
+// without): the game sets a new object's buffers up over a few frames. BowWow's skinning outputs (22048 / 3104 / 66144
+// bytes) were written more than once within 8 frames as he spawned at an area load, so they were copied for good and
+// the dispatch wrote the copy while the CPU read the frozen original (#463: at every Mabe house load and its Field
+// return on Windows / NVIDIA). Not for a small parameter block or an input (wclass 2): copying those costs nothing - the
+// GPU never writes them - and their CPU rewrites must not race the dispatch. The light / exposure lists, rewritten every
+// frame from boot, are copied once their window is over (half a second in, on the logo screens).
+#define RS_SETUP_FRAMES 30
 enum { RS_PROBE, RS_COPY, RS_PLACE };
-typedef struct { uint64_t addr, size, copy, pristine, hash, frame, seg_hash[3]; uint32_t gen, level, wgen, looks; uint8_t mode, gpu_parts, wclass, rewrites; bool cs_bound, draw_bound; } RangeState;  // (wgen, seg_hash, looks, gpu_parts, wclass: watch_check; pristine: rs_copy_make; rewrites: watch_cpu_in_allocation)
+typedef struct { uint64_t addr, size, copy, pristine, hash, frame, seg_hash[3]; uint32_t gen, level, wgen, looks; uint8_t mode, gpu_parts, wclass, rewrites; bool cs_bound, draw_bound, setup_logged; uint64_t count_from; } RangeState;  // (wgen, seg_hash, looks, gpu_parts, wclass: watch_check; pristine: rs_copy_make; rewrites: watch_cpu_in_allocation; count_from, setup_logged: snap_storage)
 static RangeState rs_tab[512];
 static uint64_t rs_store_frame[512];  // (watch: the frame of the previous CPU write seen on a range's own pages)
 static int nrs;
@@ -3132,18 +3141,21 @@ static int watch_cpu_in_allocation(const RangeState *e, uint32_t since) {
         if (k >= 0 && (o == e || !o->rewrites || o->size < 256 || !o->cs_bound || o->addr < lo || o->addr + o->size > hi)) continue;
         uint64_t p1 = (o->addr + WATCH_PAGE - 1) & ~(WATCH_PAGE - 1), pe = (o->addr + o->size) & ~(WATCH_PAGE - 1);
         uint32_t g;
-        if (p1 < pe && pages_cpu_written(p1, pe - p1, since, &g) == 1) return 1;
+        if (p1 < pe && pages_cpu_written(p1, pe - p1, since, &g) == 1) { watch_why = k < 0 ? "a page wholly its own" : "a page of a rewritten range beside it"; return 1; }
     }
     return 0;
 }
 static int pages_seen_written(uint64_t addr, uint64_t size, uint32_t since);  // (the page tables below: no OS query)
+static const char *watch_why;  // (the evidence watch_check's last 1 rests on: the copy decision's log)
 static int watch_check(RangeState *e) {
     uint32_t since = e->wgen, now = e->wgen;
     int w = pages_cpu_written(e->addr, e->size, since, &now);  // (stamps every page of the range: the parts below read the stamps)
     e->wgen = now;
     if (w < 0) return w;
     if (e->wclass & 1) return w == 1 ? watch_cpu_in_allocation(e, since) : 0;  // (a program stores into it: the GPU said so)
+    watch_why = "a page of a small range";
     if (e->size < 256) return w;
+    watch_why = "a page of an input";
     if (e->wclass == 2) {  // (only ever bound where its programs don't store: an input - every dirty page counts, e69a0df)
         if (w != 1) return 0;
         for (uint64_t plo = e->addr & ~(WATCH_PAGE - 1); plo < e->addr + e->size; plo += WATCH_PAGE)
@@ -3170,7 +3182,9 @@ static int watch_check(RangeState *e) {
     }
     e->looks++;
     if (w != 1) return 0;
+    watch_why = "a page wholly its own";
     if (lo[1] < hi[1] && pages_seen_written(lo[1], hi[1] - lo[1], since) == 1) return 1;  // (a page wholly its own)
+    watch_why = "its first / last page, shared";
     if (e->looks < 3) return 0;  // (a new range: the GPU's first writes first)
     for (int i = 0; i < 3; i += 2) {  // its first and last page, shared with other memory
         if (lo[i] >= hi[i]) continue;
@@ -3235,6 +3249,7 @@ static uint64_t snap_storage(uint64_t addr, uint64_t size, bool cs_slot) {
         if (!cs_slot) e->mode = RS_COPY, e->draw_bound = true;  // a draw's storage read: copied for good (see above)
         else if (watch_on()) {  // a compute-only range: in place; the first CPU write its pages' tracking shows makes it a copy
             e->mode = RS_PLACE;
+            e->count_from = f + RS_SETUP_FRAMES;
             watch_check(e);  // (from now: the look stamps its pages)
             rs_log(e, "new: in place, CPU writes tracked", cs_slot, f);
             return addr;
@@ -3267,8 +3282,10 @@ static uint64_t snap_storage(uint64_t addr, uint64_t size, bool cs_slot) {
     // probe again on a new level or after 10 s unused - only the hash fallback's in-place ranges: a copied range stays
     // copied (a draw's storage read, a CPU store seen), a watched one just gets its pages armed again
     bool again = !watch_on() && e->mode == RS_PLACE && (e->level != rs_level_gen || f - e->frame > 600);
-    if (e->mode == RS_PLACE && (e->level != rs_level_gen || f - e->frame > 8))  // (the watch's learning, again: the heap there may be reused)
+    if (e->mode == RS_PLACE && (e->level != rs_level_gen || f - e->frame > 8)) {  // (the watch's learning, again: the heap there may be reused)
         e->gpu_parts = 0, e->looks = 0, e->wclass = 0;
+        e->count_from = f + RS_SETUP_FRAMES, e->setup_logged = false, rs_store_frame[e - rs_tab] = 0;  // (and its setup window)
+    }
     if (cs_slot) e->wclass |= wclass_bit(snap_slot_class);  // (how its program uses the slot: the GPU's report)
     e->level = rs_level_gen;
     e->frame = f;
@@ -3284,13 +3301,27 @@ static uint64_t snap_storage(uint64_t addr, uint64_t size, bool cs_slot) {
         // A write once (an initialisation: BowWow's skinning buffers at his spawn) stays in place; writes that keep
         // coming (within 8 frames of the previous one) are the CPU rewriting it: copied from now on (renderer.m 1ea4b16)
         int k = (int)(e - rs_tab);
+        if (f < e->count_from && e->size >= 256 && e->wclass != 2) {  // (its setup window: not counted - the look above still stamped the pages and learned)
+            static int logged;
+            if (!e->setup_logged && logged++ < 2000) {  // (the first per window)
+                e->setup_logged = true;
+                char why[160];
+                snprintf(why, sizeof why, "CPU write in its setup window, not counted (%s)", watch_why);
+                rs_log(e, why, cs_slot, f);
+            }
+            return addr;
+        }
         if (!rs_store_frame[k] || f - rs_store_frame[k] > 8) { rs_store_frame[k] = f; return addr; }
         e->mode = RS_COPY;
         {   // (written on a page wholly its own: the CPU rewrites the range itself - its allocation's other ranges count its pages now)
             uint64_t p1 = (addr + WATCH_PAGE - 1) & ~(WATCH_PAGE - 1), pe = (addr + size) & ~(WATCH_PAGE - 1);
             e->rewrites = p1 < pe && pages_seen_written(p1, pe - p1, since) == 1;
         }
-        rs_log(e, "-> copy (CPU writes keep coming on its own pages)", cs_slot, f);
+        {
+            char why[160];
+            snprintf(why, sizeof why, "-> copy (CPU writes keep coming on its own pages: %s)", watch_why);
+            rs_log(e, why, cs_slot, f);
+        }
         c = rs_copy_make(e, range_hash(addr, size));
         return c ? c : addr;
     }
